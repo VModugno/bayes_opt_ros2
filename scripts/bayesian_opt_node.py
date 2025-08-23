@@ -174,9 +174,10 @@ class BayesOptNode(Node):
         self._iteration = 0
         self._stop_flag = False
 
-        # Start the optimization after a short delay so everything is wired up
+        # Start the optimization after a delay to ensure subscribers are connected
         self._started = False
-        self._starter_timer = self.create_timer(0.5, self._start_once)
+        self._startup_delay = 3.0  # Wait 3 seconds for connections
+        self._starter_timer = self.create_timer(self._startup_delay, self._start_once)
 
         # Log basic configuration
         self.get_logger().info(
@@ -207,9 +208,36 @@ class BayesOptNode(Node):
     def _start_once(self) -> None:
         if self._started:
             return
+        
+        # Check if we have subscribers before starting
+        result_subscribers = self.count_subscribers(self.topic_result_in)
+        allow_subscribers = self.count_subscribers(self.topic_allow_in)
+        
+        if result_subscribers == 0 or allow_subscribers == 0:
+            self.get_logger().warn(
+                f"Waiting for experiment client to connect... "
+                f"(result_subscribers: {result_subscribers}, allow_subscribers: {allow_subscribers})"
+            )
+            # Try again in 2 seconds
+            self._starter_timer = self.create_timer(2.0, self._start_once)
+            return
+        
+        self.get_logger().info(
+            f"Experiment client connected! "
+            f"(result_subscribers: {result_subscribers}, allow_subscribers: {allow_subscribers})"
+        )
+        self.get_logger().info("Waiting additional 2 seconds for ROS2 connections to fully establish...")
+        
         self._started = True
         self._starter_timer.cancel()
-        threading.Thread(target=self._run_optimization, daemon=True).start()
+        
+        # Wait a bit more for ROS2 pub/sub connections to fully establish
+        def delayed_start():
+            time.sleep(2.0)  # Additional delay for connection stability
+            self.get_logger().info("Starting optimization now!")
+            self._run_optimization()
+        
+        threading.Thread(target=delayed_start, daemon=True).start()
 
     def destroy_node(self) -> bool:
         # Signal any waiting objective to unblock cleanly
@@ -238,14 +266,15 @@ class BayesOptNode(Node):
         # Ordered vector matching self.param_names
         vec = [float(kwargs[name]) for name in self.param_names]
 
-        # Publish suggestion for the external experiment
-        self._publish_params(vec)
-
-        # Reset gating state for this iteration
+        # Reset gating state BEFORE publishing params
         with self._lock:
             self._last_result_value = None
+            self._allow_flag = False  # Reset allow flag for this iteration
             self._result_event.clear()
             self._allow_event.clear()
+
+        # Publish suggestion for the external experiment
+        self._publish_params(vec)
 
         start_time = time.time()
         # Wait until we have BOTH a result and allow=True
